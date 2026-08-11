@@ -3,10 +3,9 @@ import json
 import websockets
 import os
 
-# Estruturas de memória (RAM)
-conexoes = {}  # {user_id: websocket}
-usuarios = {}  # {user_id: {"id":..., "nome":..., "senha":...}}
-mensagens = {} # {conversa_key: [lista_de_mensagens]}
+conexoes = {}  
+usuarios = {}  
+mensagens = {} 
 
 def get_conversa_key(id1, id2):
     ids = sorted([str(id1), str(id2)])
@@ -20,7 +19,7 @@ async def handler(websocket):
 
             # REGISTRO
             if tipo == "registro":
-                id_usuario = data.get("nome", "user").lower() + "_" + str(len(usuarios) + 1)
+                id_usuario = f"000.{len(usuarios) + 1:04d}"
                 usuarios[id_usuario] = {
                     "id": id_usuario,
                     "nome": data.get("nome"),
@@ -60,23 +59,28 @@ async def handler(websocket):
             elif tipo == "mensagem":
                 de = next((id for id, ws in conexoes.items() if ws == websocket), None)
                 para = data.get("para")
-                msg_obj = {
-                    "id": data.get("id"),
-                    "de": de,
-                    "para": para,
-                    "texto": data.get("texto"),
-                    "tipo_mensagem": data.get("tipo_mensagem", "texto"),
-                    "hora": data.get("hora"),
-                    "timestamp": data.get("timestamp")
-                }
+                if not de or not para: continue
                 
+                msg_id = data.get("id")
                 key = get_conversa_key(de, para)
                 if key not in mensagens: mensagens[key] = []
-                mensagens[key].append(msg_obj)
+                
+                # Proteção do servidor contra mensagens duplicadas
+                if not any(m.get("id") == msg_id for m in mensagens[key]):
+                    msg_obj = {
+                        "id": msg_id,
+                        "de": de,
+                        "para": para,
+                        "texto": data.get("texto"),
+                        "tipo_mensagem": data.get("tipo_mensagem", "texto"),
+                        "hora": data.get("hora"),
+                        "timestamp": data.get("timestamp")
+                    }
+                    mensagens[key].append(msg_obj)
 
-                await websocket.send(json.dumps({"tipo": "mensagem_enviada", "mensagem": msg_obj}))
-                if para in conexoes:
-                    await conexoes[para].send(json.dumps({"tipo": "mensagem", "mensagem": msg_obj}))
+                    await websocket.send(json.dumps({"tipo": "mensagem_enviada", "mensagem": msg_obj}))
+                    if para in conexoes:
+                        await conexoes[para].send(json.dumps({"tipo": "mensagem", "mensagem": msg_obj}))
 
             # HISTÓRICO
             elif tipo == "historico":
@@ -84,6 +88,13 @@ async def handler(websocket):
                 para = data.get("para")
                 key = get_conversa_key(de, para)
                 await websocket.send(json.dumps({"tipo": "historico", "mensagens": mensagens.get(key, [])}))
+                
+            # APAGAR CONTA
+            elif tipo == "apagar_conta":
+                de = next((id for id, ws in conexoes.items() if ws == websocket), None)
+                if de and de in usuarios:
+                    del usuarios[de]
+                await websocket.send(json.dumps({"tipo": "conta_apagada"}))
 
     except Exception as e:
         print(f"Erro na conexão: {e}")
@@ -95,9 +106,10 @@ async def handler(websocket):
 async def main():
     port = int(os.environ.get("PORT", 8080))
     async with websockets.serve(handler, "0.0.0.0", port):
-        print(f"Servidor NEXUS iniciado com sucesso na porta {port}")
-        await asyncio.Future()  # Mantém o processo ativo no Render
+        print(f"Servidor NEXUS iniciado na porta {port}")
+        await asyncio.Future()
 
 if __name__ == "__main__":
     asyncio.run(main())
+                
                                                      
