@@ -12,7 +12,7 @@ def get_conversa_key(id1, id2):
     ids = sorted([str(id1), str(id2)])
     return f"{ids[0]}_{ids[1]}"
 
-async def handler(websocket, path):
+async def handler(websocket):
     try:
         async for message in websocket:
             data = json.loads(message)
@@ -20,7 +20,7 @@ async def handler(websocket, path):
 
             # REGISTRO
             if tipo == "registro":
-                id_usuario = data.get("nome").lower() + "_" + str(len(usuarios) + 1)
+                id_usuario = data.get("nome", "user").lower() + "_" + str(len(usuarios) + 1)
                 usuarios[id_usuario] = {
                     "id": id_usuario,
                     "nome": data.get("nome"),
@@ -28,7 +28,12 @@ async def handler(websocket, path):
                     "senha": data.get("senha")
                 }
                 conexoes[id_usuario] = websocket
-                await websocket.send(json.dumps({"tipo": "registro_ok", "id": id_usuario, "nome": data.get("nome"), "sobrenome": data.get("sobrenome")}))
+                await websocket.send(json.dumps({
+                    "tipo": "registro_ok", 
+                    "id": id_usuario, 
+                    "nome": data.get("nome"), 
+                    "sobrenome": data.get("sobrenome")
+                }))
 
             # LOGIN
             elif tipo == "login":
@@ -37,7 +42,12 @@ async def handler(websocket, path):
                 user = usuarios.get(user_id)
                 if user and user["senha"] == senha:
                     conexoes[user_id] = websocket
-                    await websocket.send(json.dumps({"tipo": "login_ok", "id": user["id"], "nome": user["nome"], "sobrenome": user["sobrenome"]}))
+                    await websocket.send(json.dumps({
+                        "tipo": "login_ok", 
+                        "id": user["id"], 
+                        "nome": user["nome"], 
+                        "sobrenome": user["sobrenome"]
+                    }))
                 else:
                     await websocket.send(json.dumps({"tipo": "erro", "mensagem": "Credenciais inválidas"}))
 
@@ -64,10 +74,7 @@ async def handler(websocket, path):
                 if key not in mensagens: mensagens[key] = []
                 mensagens[key].append(msg_obj)
 
-                # Envia para quem mandou
                 await websocket.send(json.dumps({"tipo": "mensagem_enviada", "mensagem": msg_obj}))
-                
-                # Envia para o destino se estiver online
                 if para in conexoes:
                     await conexoes[para].send(json.dumps({"tipo": "mensagem", "mensagem": msg_obj}))
 
@@ -79,14 +86,18 @@ async def handler(websocket, path):
                 await websocket.send(json.dumps({"tipo": "historico", "mensagens": mensagens.get(key, [])}))
 
     except Exception as e:
-        print(f"Erro: {e}")
+        print(f"Erro na conexão: {e}")
     finally:
-        # Remove conexão ao desconectar
         for uid, ws in list(conexoes.items()):
             if ws == websocket:
                 del conexoes[uid]
 
-start_server = websockets.serve(handler, "0.0.0.0", int(os.environ.get("PORT", 8080)))
-asyncio.get_event_loop().run_until_complete(start_server)
-asyncio.get_event_loop().run_forever()
-                    
+async def main():
+    port = int(os.environ.get("PORT", 8080))
+    async with websockets.serve(handler, "0.0.0.0", port):
+        print(f"Servidor NEXUS iniciado com sucesso na porta {port}")
+        await asyncio.Future()  # Mantém o processo ativo no Render
+
+if __name__ == "__main__":
+    asyncio.run(main())
+    
