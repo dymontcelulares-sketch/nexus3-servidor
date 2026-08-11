@@ -1,115 +1,190 @@
 import asyncio
 import json
-import websockets
 import os
+import websockets
 
-conexoes = {}  
-usuarios = {}  
-mensagens = {} 
+USERS_FILE = "users.json"
+MESSAGES_FILE = "messages.json"
 
-def get_conversa_key(id1, id2):
-    ids = sorted([str(id1), str(id2)])
+def carregar_dados(arquivo, padrao):
+    if os.path.exists(arquivo):
+        try:
+            with open(arquivo, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except:
+            pass
+    return padrao
+
+def salvar_dados(arquivo, dados):
+    with open(arquivo, "w", encoding="utf-8") as f:
+        json.dump(dados, f, ensure_ascii=False, indent=2)
+
+usuarios = carregar_dados(USERS_FILE, {})
+mensagens_db = carregar_dados(MESSAGES_FILE, {})
+clientes_ativos = {}
+
+def gerar_id():
+    import random
+    return f"{random.randint(100, 999)}.{random.randint(1000, 9999)}"
+
+def chave_conversa(a, b):
+    ids = sorted([str(a), str(b)])
     return f"{ids[0]}_{ids[1]}"
 
 async def handler(websocket):
+    usuario_atual_id = None
     try:
         async for message in websocket:
-            data = json.loads(message)
+            try:
+                data = json.loads(message)
+            except json.JSONDecodeError:
+                continue
+
             tipo = data.get("tipo")
 
-            # REGISTRO
             if tipo == "registro":
-                id_usuario = f"000.{len(usuarios) + 1:04d}"
-                usuarios[id_usuario] = {
-                    "id": id_usuario,
-                    "nome": data.get("nome"),
-                    "sobrenome": data.get("sobrenome"),
-                    "senha": data.get("senha")
+                nome = data.get("nome", "").strip()
+                sobrenome = data.get("sobrenome", "").strip()
+                senha = data.get("senha", "")
+                
+                if not nome or not sobrenome or not senha:
+                    await websocket.send(json.dumps({"tipo": "erro", "mensagem": "Preencha todos os campos."}))
+                    continue
+
+                novo_id = gerar_id()
+                while novo_id in usuarios:
+                    novo_id = gerar_id()
+
+                usuarios[novo_id] = {
+                    "id": novo_id,
+                    "nome": nome,
+                    "sobrenome": sobrenome,
+                    "senha": senha
                 }
-                conexoes[id_usuario] = websocket
+                salvar_dados(USERS_FILE, usuarios)
+
+                usuario_atual_id = novo_id
+                clientes_ativos[novo_id] = websocket
+
                 await websocket.send(json.dumps({
-                    "tipo": "registro_ok", 
-                    "id": id_usuario, 
-                    "nome": data.get("nome"), 
-                    "sobrenome": data.get("sobrenome")
+                    "tipo": "registro_ok",
+                    "id": novo_id,
+                    "nome": nome,
+                    "sobrenome": sobrenome
+                }))
+                await broadcast_usuarios()
+
+            elif tipo == "login":
+                uid = data.get("id")
+                senha = data.get("senha")
+
+                if uid not in usuarios or usuarios[uid]["senha"] != senha:
+                    await websocket.send(json.dumps({"tipo": "erro", "mensagem": "Credenciais inválidas."}))
+                    continue
+
+                usuario_atual_id = uid
+                clientes_ativos[uid] = websocket
+
+                user = usuarios[uid]
+                await websocket.send(json.dumps({
+                    "tipo": "login_ok",
+                    "id": user["id"],
+                    "nome": user["nome"],
+                    "sobrenome": user["sobrenome"]
+                }))
+                await broadcast_usuarios()
+
+            elif tipo == "usuarios":
+                lista_publica = [
+                    {"id": u["id"], "nome": u["nome"], "sobrenome": u["sobrenome"]}
+                    for u in usuarios.values()
+                ]
+                await websocket.send(json.dumps({"tipo": "usuarios", "usuarios": lista_publica}))
+
+            elif tipo == "historico":
+                if not usuario_atual_id:
+                    continue
+                para = data.get("para")
+                key = chave_conversa(usuario_atual_id, para)
+                msgs = mensagens_db.get(key, [])
+                await websocket.send(json.dumps({
+                    "tipo": "historico_conversa",
+                    "mensagens": msgs
                 }))
 
-            # LOGIN
-            elif tipo == "login":
-                user_id = data.get("id")
-                senha = data.get("senha")
-                user = usuarios.get(user_id)
-                if user and user["senha"] == senha:
-                    conexoes[user_id] = websocket
-                    await websocket.send(json.dumps({
-                        "tipo": "login_ok", 
-                        "id": user["id"], 
-                        "nome": user["nome"], 
-                        "sobrenome": user["sobrenome"]
-                    }))
-                else:
-                    await websocket.send(json.dumps({"tipo": "erro", "mensagem": "Credenciais inválidas"}))
-
-            # LISTA USUÁRIOS
-            elif tipo == "usuarios":
-                lista = [{"id": u["id"], "nome": u["nome"], "sobrenome": u["sobrenome"]} for u in usuarios.values()]
-                await websocket.send(json.dumps({"tipo": "usuarios", "usuarios": lista}))
-
-            # MENSAGEM
             elif tipo == "mensagem":
-                de = next((id for id, ws in conexoes.items() if ws == websocket), None)
+                if not usuario_atual_id:
+                    continue
                 para = data.get("para")
-                if not de or not para: continue
-                
+                texto = data.get("texto")
+                tipo_msg = data.get("tipo_mensagem", "texto")
+                hora = data.get("hora")
+                timestamp = data.get("timestamp")
+                seq = data.get("seq")
                 msg_id = data.get("id")
-                key = get_conversa_key(de, para)
-                if key not in mensagens: mensagens[key] = []
-                
-                # Proteção do servidor contra mensagens duplicadas
-                if not any(m.get("id") == msg_id for m in mensagens[key]):
-                    msg_obj = {
-                        "id": msg_id,
-                        "de": de,
-                        "para": para,
-                        "texto": data.get("texto"),
-                        "tipo_mensagem": data.get("tipo_mensagem", "texto"),
-                        "hora": data.get("hora"),
-                        "timestamp": data.get("timestamp")
-                    }
-                    mensagens[key].append(msg_obj)
 
-                    await websocket.send(json.dumps({"tipo": "mensagem_enviada", "mensagem": msg_obj}))
-                    if para in conexoes:
-                        await conexoes[para].send(json.dumps({"tipo": "mensagem", "mensagem": msg_obj}))
+                msg_obj = {
+                    "id": msg_id,
+                    "de": usuario_atual_id,
+                    "para": para,
+                    "texto": texto,
+                    "tipo": tipo_msg,
+                    "hora": hora,
+                    "timestamp": timestamp,
+                    "seq": seq
+                }
 
-            # HISTÓRICO
-            elif tipo == "historico":
-                de = next((id for id, ws in conexoes.items() if ws == websocket), None)
-                para = data.get("para")
-                key = get_conversa_key(de, para)
-                await websocket.send(json.dumps({"tipo": "historico", "mensagens": mensagens.get(key, [])}))
+                key = chave_conversa(usuario_atual_id, para)
+                if key not in mensagens_db:
+                    mensagens_db[key] = []
                 
-            # APAGAR CONTA
+                if not any(m.get("id") == msg_id for m in mensagens_db[key]):
+                    mensagens_db[key].append(msg_obj)
+                    salvar_dados(MESSAGES_FILE, mensagens_db)
+
+                if para in clientes_ativos:
+                    try:
+                        await clientes_ativos[para].send(json.dumps({
+                            "tipo": "mensagem",
+                            "mensagem": msg_obj
+                        }))
+                    except:
+                        pass
+
             elif tipo == "apagar_conta":
-                de = next((id for id, ws in conexoes.items() if ws == websocket), None)
-                if de and de in usuarios:
-                    del usuarios[de]
-                await websocket.send(json.dumps({"tipo": "conta_apagada"}))
+                if usuario_atual_id and usuario_atual_id in usuarios:
+                    del usuarios[usuario_atual_id]
+                    salvar_dados(USERS_FILE, usuarios)
+                    await websocket.send(json.dumps({"tipo": "conta_apagada"}))
+                    break
 
-    except Exception as e:
-        print(f"Erro na conexão: {e}")
+    except websockets.exceptions.ConnectionClosed:
+        pass
     finally:
-        for uid, ws in list(conexoes.items()):
-            if ws == websocket:
-                del conexoes[uid]
+        if usuario_atual_id and usuario_atual_id in clientes_ativos:
+            del clientes_ativos[usuario_atual_id]
+        await broadcast_usuarios()
+
+async def broadcast_usuarios():
+    if not clientes_ativos:
+        return
+    lista_publica = [
+        {"id": u["id"], "nome": u["nome"], "sobrenome": u["sobrenome"]}
+        for u in usuarios.values()
+    ]
+    payload = json.dumps({"tipo": "usuarios", "usuarios": lista_publica})
+    for ws in list(clientes_ativos.values()):
+        try:
+            await ws.send(payload)
+        except:
+            pass
 
 async def main():
-    port = int(os.environ.get("PORT", 8080))
+    port = int(os.environ.get("PORT", 8765))
     async with websockets.serve(handler, "0.0.0.0", port):
-        print(f"Servidor NEXUS iniciado na porta {port}")
+        print(f"Servidor NEXUS rodando na porta {port}...")
         await asyncio.Future()
 
 if __name__ == "__main__":
     asyncio.run(main())
                 
-                                                     
