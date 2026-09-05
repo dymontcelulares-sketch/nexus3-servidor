@@ -1,63 +1,53 @@
 import asyncio,json,os,time,secrets,hashlib
 import websockets
+from motor.motor_asyncio import AsyncIOMotorClient
 
 HOST="0.0.0.0"
 PORT=int(os.getenv("PORT","10000"))
-BASE=os.path.dirname(os.path.abspath(__file__))
-DATA=os.path.join(BASE,"data")
-USERS=os.path.join(DATA,"usuarios.json")
-MSGS=os.path.join(DATA,"mensagens.json")
-CONFIG=os.path.join(DATA,"config.json")
+
+MONGO_URI="mongodb+srv://dymontcelulares_db_user:r3uYIQqHdvL5lnNs@cluster0.owpwsaz.mongodb.net/?appName=Cluster0"
+DB_NAME="nexus"
+
 ADMIN_PASSWORD=os.getenv("ADMIN_PASSWORD","41914598")
 MAX_FOTO=3*1024*1024
 MAX_MSG=10*1024*1024
 
-os.makedirs(DATA,exist_ok=True)
+mongo=AsyncIOMotorClient(MONGO_URI)
+db=mongo[DB_NAME]
+
+usuarios=db.usuarios
+mensagens=db.mensagens
+config=db.config
+
 lock=asyncio.Lock()
 online={}
 
-def load(path,default):
-    try:
-        if os.path.exists(path):
-            with open(path,"r",encoding="utf-8") as f:return json.load(f)
-    except Exception as e:print("[JSON]",e)
-    return default
-
-def save(path,data):
-    tmp=path+".tmp"
-    try:
-        with open(tmp,"w",encoding="utf-8") as f:
-            json.dump(data,f,ensure_ascii=False,separators=(",",":"))
-        os.replace(tmp,path)
-        return True
-    except Exception as e:
-        print("[JSON]",e)
-        try:os.remove(tmp)
-        except:pass
-        return False
-
-usuarios=load(USERS,{})
-mensagens=load(MSGS,{})
-config=load(CONFIG,{"ultimo_id":0})
 
 def senha_hash(s):
     return hashlib.sha256(s.encode()).hexdigest()
 
-def gerar_id():
-    n=int(config.get("ultimo_id",0))
-    while True:
-        n+=1
-        uid=f"{n//10000:03d}.{n%10000:04d}"
-        if uid not in usuarios:break
-    config["ultimo_id"]=n
-    save(CONFIG,config)
-    return uid
 
-def perfil(uid):
-    u=usuarios.get(str(uid))
+def chave(a,b):
+    return "_".join(sorted([str(a),str(b)]))
+
+
+async def gerar_id():
+    r=await config.find_one_and_update(
+        {"_id":"contador"},
+        {"$inc":{"ultimo_id":1}},
+        upsert=True,
+        return_document=True
+    )
+    n=r["ultimo_id"]
+    return f"{n//10000:03d}.{n%10000:04d}"
+
+
+async def perfil(uid):
+    u=await usuarios.find_one({"_id":str(uid)})
     if not u:return None
+
     return {
-        "id":u["id"],
+        "id":u["_id"],
         "nome":u.get("nome",""),
         "sobrenome":u.get("sobrenome",""),
         "foto":u.get("foto",""),
@@ -67,6 +57,7 @@ def perfil(uid):
         "banido":bool(u.get("banido",False))
     }
 
+
 async def send(ws,data):
     try:
         await ws.send(json.dumps(data,ensure_ascii=False,separators=(",",":")))
@@ -74,28 +65,34 @@ async def send(ws,data):
     except:
         return False
 
+
 async def sendto(uid,data):
     ws=online.get(str(uid))
     if not ws:return False
+
     ok=await send(ws,data)
+
     if not ok and online.get(str(uid))==ws:
         online.pop(str(uid),None)
+
     return ok
+
 
 async def error(ws,msg,codigo=None):
     d={"tipo":"erro","mensagem":msg}
     if codigo:d["codigo"]=codigo
     await send(ws,d)
 
-def chave(a,b):
-    return "_".join(sorted([str(a),str(b)]))
 
 async def transmitir_perfil(uid):
-    p=perfil(uid)
+    p=await perfil(uid)
     if not p:return
+
     pacote={"tipo":"perfil_update","perfil":p}
+
     for x in list(online):
         await sendto(x,pacote)
+
 
 async def registro(ws,d):
     nome=str(d.get("nome","")).strip()
@@ -107,11 +104,11 @@ async def registro(ws,d):
     if not senha:return await error(ws,"Digite uma senha.")
 
     async with lock:
-        uid=gerar_id()
+        uid=await gerar_id()
         admin=senha==ADMIN_PASSWORD
 
-        usuarios[uid]={
-            "id":uid,
+        u={
+            "_id":uid,
             "nome":nome,
             "sobrenome":sobrenome,
             "senha":senha_hash(senha),
@@ -122,12 +119,14 @@ async def registro(ws,d):
             "criado_em":int(time.time())
         }
 
-        if not save(USERS,usuarios):
-            usuarios.pop(uid,None)
+        try:
+            await usuarios.insert_one(u)
+        except Exception as e:
+            print("[MONGO]",e)
             return await error(ws,"Não foi possível criar sua conta.")
 
     online[uid]=ws
-    p=perfil(uid)
+    p=await perfil(uid)
 
     await send(ws,{
         "tipo":"registro_ok",
@@ -143,10 +142,12 @@ async def registro(ws,d):
     print(f"[REGISTRO] {uid} | {nome} {sobrenome} | ADMIN={admin}")
     return uid
 
+
 async def login(ws,d):
     uid=str(d.get("id","")).strip()
     senha=str(d.get("senha",""))
-    u=usuarios.get(uid)
+
+    u=await usuarios.find_one({"_id":uid})
 
     if not uid or not u or senha_hash(senha)!=u.get("senha",""):
         return await error(ws,"Nexus ID ou senha incorretos.")
@@ -157,13 +158,11 @@ async def login(ws,d):
     old=online.get(uid)
 
     if old and old!=ws:
-        try:
-            await old.close()
-        except:
-            pass
+        try:await old.close()
+        except:pass
 
     online[uid]=ws
-    p=perfil(uid)
+    p=await perfil(uid)
 
     await send(ws,{
         "tipo":"login_ok",
@@ -179,18 +178,24 @@ async def login(ws,d):
     print(f"[LOGIN] {uid} | ADMIN={u.get('admin',False)} | VERIFICADO={u.get('verificado',False)}")
     return uid
 
+
 async def usuarios_lista(ws):
     lista=[]
 
-    for x in usuarios:
-        p=perfil(x)
-        if p:
-            lista.append(p)
+    async for u in usuarios.find({}):
+        lista.append({
+            "id":u["_id"],
+            "nome":u.get("nome",""),
+            "sobrenome":u.get("sobrenome",""),
+            "foto":u.get("foto",""),
+            "online":u["_id"] in online,
+            "verificado":bool(u.get("verificado",False)),
+            "admin":bool(u.get("admin",False)),
+            "banido":bool(u.get("banido",False))
+        })
 
-    await send(ws,{
-        "tipo":"usuarios",
-        "usuarios":lista
-    })
+    await send(ws,{"tipo":"usuarios","usuarios":lista})
+
 
 async def foto(uid,d,ws):
     foto=d.get("foto","")
@@ -204,16 +209,15 @@ async def foto(uid,d,ws):
     if foto and not foto.startswith("data:image/"):
         return await error(ws,"Formato de foto inválido.")
 
-    async with lock:
-        if uid not in usuarios:
-            return
+    r=await usuarios.update_one(
+        {"_id":uid},
+        {"$set":{"foto":foto}}
+    )
 
-        usuarios[uid]["foto"]=foto
+    if not r.matched_count:
+        return await error(ws,"Usuário não encontrado.")
 
-        if not save(USERS,usuarios):
-            return await error(ws,"Não foi possível salvar a foto.")
-
-    p=perfil(uid)
+    p=await perfil(uid)
 
     await send(ws,{
         "tipo":"perfil_atualizado",
@@ -222,28 +226,38 @@ async def foto(uid,d,ws):
 
     await transmitir_perfil(uid)
 
+
 async def perfil_req(ws,d):
     uid=str(d.get("id","")).strip()
+    p=await perfil(uid)
 
-    if uid not in usuarios:
+    if not p:
         return await error(ws,"Usuário não encontrado.")
 
     await send(ws,{
         "tipo":"perfil",
-        "perfil":perfil(uid)
+        "perfil":p
     })
+
 
 async def historico(ws,uid,d):
     outro=str(d.get("para","")).strip()
 
-    if outro not in usuarios:
+    if not await usuarios.find_one({"_id":outro}):
         return await send(ws,{
             "tipo":"historico",
             "para":outro,
             "mensagens":[]
         })
 
-    lista=mensagens.get(chave(uid,outro),[])[-1000:]
+    k=chave(uid,outro)
+
+    doc=await mensagens.find_one(
+        {"_id":k},
+        {"mensagens":{"$slice":-1000}}
+    )
+
+    lista=doc.get("mensagens",[]) if doc else []
 
     await send(ws,{
         "tipo":"historico",
@@ -251,24 +265,29 @@ async def historico(ws,uid,d):
         "mensagens":lista
     })
 
-async def mensagem(uid,d):
-    u=usuarios.get(uid)
 
-    if not u:
-        return
+async def mensagem(uid,d):
+    u=await usuarios.find_one({"_id":uid})
+
+    if not u:return
 
     if u.get("banido",False):
-        return await error(online.get(uid),"Esta conta foi banida.","BANIDO") if online.get(uid) else None
+        ws=online.get(uid)
+        if ws:
+            await error(ws,"Esta conta foi banida.","BANIDO")
+        return
 
     para=str(d.get("para","")).strip()
 
-    if para not in usuarios:
+    destino=await usuarios.find_one({"_id":para})
+
+    if not destino:
         return await sendto(uid,{
             "tipo":"erro",
             "mensagem":"Usuário não encontrado."
         })
 
-    if usuarios.get(para,{}).get("banido",False):
+    if destino.get("banido",False):
         return await sendto(uid,{
             "tipo":"erro",
             "mensagem":"Este usuário está banido."
@@ -312,7 +331,7 @@ async def mensagem(uid,d):
         "hora":d.get("hora",""),
         "timestamp":timestamp,
         "seq":seq,
-        "perfil_remetente":perfil(uid),
+        "perfil_remetente":await perfil(uid),
         "nome_remetente":u.get("nome",""),
         "sobrenome_remetente":u.get("sobrenome",""),
         "foto_perfil_remetente":u.get("foto",""),
@@ -323,17 +342,25 @@ async def mensagem(uid,d):
     k=chave(uid,para)
 
     async with lock:
-        mensagens.setdefault(k,[])
+        doc=await mensagens.find_one({"_id":k})
 
-        if not any(x.get("id")==mid for x in mensagens[k]):
-            mensagens[k].append(msg)
+        if doc and any(x.get("id")==mid for x in doc.get("mensagens",[])):
+            return
 
-        mensagens[k]=mensagens[k][-2000:]
+        if doc:
+            arr=doc.get("mensagens",[])
+            arr.append(msg)
+            arr=arr[-2000:]
 
-        if not save(MSGS,mensagens):
-            return await sendto(uid,{
-                "tipo":"erro",
-                "mensagem":"Não foi possível salvar a mensagem."
+            await mensagens.update_one(
+                {"_id":k},
+                {"$set":{"mensagens":arr}}
+            )
+        else:
+            await mensagens.insert_one({
+                "_id":k,
+                "usuarios":[uid,para],
+                "mensagens":[msg]
             })
 
     entregue=await sendto(para,{
@@ -347,21 +374,24 @@ async def mensagem(uid,d):
         "entregue":entregue
     })
 
-def eh_admin(uid):
-    u=usuarios.get(uid)
 
+def eh_admin(uid,u=None):
     return bool(
         u and
         u.get("admin",False) and
         not u.get("banido",False)
     )
 
+
 async def exigir_admin(ws,uid):
-    if not eh_admin(uid):
+    u=await usuarios.find_one({"_id":uid})
+
+    if not eh_admin(uid,u):
         await error(ws,"Acesso negado.","SEM_PERMISSAO")
         return False
 
     return True
+
 
 async def admin_acao(uid,d,ws):
     if not await exigir_admin(ws,uid):
@@ -369,7 +399,8 @@ async def admin_acao(uid,d,ws):
 
     alvo=str(d.get("id","")).strip()
     acao=str(d.get("acao","")).strip()
-    u=usuarios.get(alvo)
+
+    u=await usuarios.find_one({"_id":alvo})
 
     if not u:
         return await error(ws,"Usuário não encontrado.")
@@ -378,14 +409,25 @@ async def admin_acao(uid,d,ws):
         return await error(ws,"Você não pode alterar sua própria conta.")
 
     if acao=="verificar":
-        u["verificado"]=True
+        await usuarios.update_one(
+            {"_id":alvo},
+            {"$set":{"verificado":True}}
+        )
 
     elif acao=="remover_verificado":
-        u["verificado"]=False
+        await usuarios.update_one(
+            {"_id":alvo},
+            {"$set":{"verificado":False}}
+        )
 
     elif acao=="banir":
-        u["banido"]=True
-        u["verificado"]=False
+        await usuarios.update_one(
+            {"_id":alvo},
+            {"$set":{
+                "banido":True,
+                "verificado":False
+            }}
+        )
 
         alvo_ws=online.get(alvo)
 
@@ -396,23 +438,21 @@ async def admin_acao(uid,d,ws):
                 "codigo":"BANIDO"
             })
 
-            try:
-                await alvo_ws.close()
-            except:
-                pass
+            try:await alvo_ws.close()
+            except:pass
 
             online.pop(alvo,None)
 
     elif acao=="desbanir":
-        u["banido"]=False
+        await usuarios.update_one(
+            {"_id":alvo},
+            {"$set":{"banido":False}}
+        )
 
     else:
         return await error(ws,"Ação administrativa inválida.")
 
-    if not save(USERS,usuarios):
-        return await error(ws,"Não foi possível salvar a alteração.")
-
-    p=perfil(alvo)
+    p=await perfil(alvo)
 
     await send(ws,{
         "tipo":"admin_ok",
@@ -424,28 +464,16 @@ async def admin_acao(uid,d,ws):
 
     print(f"[ADMIN] {uid} -> {acao} -> {alvo}")
 
+
 async def apagar_conta(uid,ws):
-    if uid not in usuarios:
+    if not await usuarios.find_one({"_id":uid}):
         return await error(ws,"Conta não encontrada.")
 
-    async with lock:
-        usuarios.pop(uid,None)
+    await usuarios.delete_one({"_id":uid})
 
-        apagar_chaves=[]
-
-        for k in mensagens:
-            partes=k.split("_")
-
-            if uid in partes:
-                apagar_chaves.append(k)
-
-        for k in apagar_chaves:
-            mensagens.pop(k,None)
-
-        if not save(USERS,usuarios):
-            return await error(ws,"Não foi possível apagar a conta.")
-
-        save(MSGS,mensagens)
+    await mensagens.delete_many({
+        "usuarios":uid
+    })
 
     online.pop(uid,None)
 
@@ -460,12 +488,11 @@ async def apagar_conta(uid,ws):
             "id":uid
         })
 
-    try:
-        await ws.close()
-    except:
-        pass
+    try:await ws.close()
+    except:pass
 
     print(f"[CONTA APAGADA] {uid}")
+
 
 async def handler(ws):
     uid=None
@@ -482,49 +509,35 @@ async def handler(ws):
             tipo=d.get("tipo")
 
             if tipo=="registro":
-
-                if uid:
-                    continue
-
-                uid=await registro(ws,d)
+                if not uid:
+                    uid=await registro(ws,d)
 
             elif tipo=="login":
-
-                if uid:
-                    continue
-
-                uid=await login(ws,d)
+                if not uid:
+                    uid=await login(ws,d)
 
             elif not uid:
-
                 await error(ws,"Faça login primeiro.","NAO_AUTENTICADO")
 
             elif tipo=="usuarios":
-
                 await usuarios_lista(ws)
 
             elif tipo in ("foto","atualizar_foto","perfil_foto"):
-
                 await foto(uid,d,ws)
 
             elif tipo=="perfil":
-
                 await perfil_req(ws,d)
 
             elif tipo=="historico":
-
                 await historico(ws,uid,d)
 
             elif tipo=="mensagem":
-
                 await mensagem(uid,d)
 
             elif tipo=="admin":
-
                 await admin_acao(uid,d,ws)
 
             elif tipo in ("apagar_conta","excluir_conta","deletar_conta"):
-
                 await apagar_conta(uid,ws)
                 uid=None
                 break
@@ -536,13 +549,23 @@ async def handler(ws):
         print("[SERVER]",e)
 
     finally:
-
         if uid and online.get(uid)==ws:
             online.pop(uid,None)
             await transmitir_perfil(uid)
             print(f"[OFFLINE] {uid}")
 
+
 async def main():
+    try:
+        await mongo.admin.command("ping")
+        print("[MONGO] Conectado com sucesso!")
+    except Exception as e:
+        print("[MONGO] ERRO:",e)
+        return
+
+    await usuarios.create_index("id")
+    await mensagens.create_index("usuarios")
+
     print(f"NEXUS iniciado em {HOST}:{PORT}")
 
     async with websockets.serve(
@@ -554,6 +577,7 @@ async def main():
         ping_timeout=30
     ):
         await asyncio.Future()
+
 
 if __name__=="__main__":
     asyncio.run(main())
