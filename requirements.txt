@@ -1,6 +1,1 @@
-websockets>=13,<16
-motor>=3.7,<4
-pymongo>=4.9,<5
-dnspython>=2.6
-
-
+websockets==15.0.1
